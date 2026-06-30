@@ -1,5 +1,7 @@
 # condor_dash
 
+<img width="500" alt="demo" src="https://github.com/user-attachments/assets/bd8d05f0-bd8d-4df3-9b95-5a397bece26c" />
+
 An **interactive** terminal dashboard for HTCondor users. One screen answers:
 
 - **My jobs** — what's running/idle/held, on which GPU node, CPU/GPU each, runtime

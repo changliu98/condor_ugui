@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+#
+# condor_gui — launch the interactive HTCondor dashboard (condor_dash.py).
+#
+# A thin wrapper: it finds condor_dash.py next to this script (following
+# symlinks, so it works when installed via a symlink on your PATH), picks a
+# Python 3 interpreter, and execs the dashboard, forwarding any arguments.
+#
+# Examples:
+#   condor_gui                 # live, navigable dashboard
+#   condor_gui --once          # print one snapshot and exit
+#   condor_gui --interval 10   # live, custom refresh seconds
+#   condor_gui --user alice    # inspect another user's jobs & priority
+#   condor_gui --no-color      # plain text (good for logging / piping)
+#
+set -euo pipefail
+
+# --- Resolve the real location of this script (works through symlinks) --------
+source="${BASH_SOURCE[0]}"
+while [ -h "$source" ]; do
+  dir="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+  source="$(readlink "$source")"
+  [[ $source != /* ]] && source="$dir/$source"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$source")" >/dev/null 2>&1 && pwd)"
+
+DASH="$SCRIPT_DIR/condor_dash.py"
+
+# --- Sanity checks ------------------------------------------------------------
+if [ ! -f "$DASH" ]; then
+  echo "condor_gui: cannot find condor_dash.py next to this script ($DASH)" >&2
+  exit 1
+fi
+
+# Pick a Python 3 interpreter (the dashboard is pure standard library).
+PY=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1; then
+    PY="$cand"
+    break
+  fi
+done
+if [ -z "$PY" ]; then
+  echo "condor_gui: no python3 interpreter found on PATH." >&2
+  exit 1
+fi
+
+# Friendly heads-up if the condor CLIs are absent. The dashboard still runs and
+# shows per-panel errors, but this explains an otherwise empty-looking screen.
+if ! command -v condor_q >/dev/null 2>&1; then
+  echo "condor_gui: warning — condor_q not found on PATH; panels may show errors." >&2
+fi
+
+exec "$PY" "$DASH" "$@"

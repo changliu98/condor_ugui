@@ -519,6 +519,63 @@ def collect_priority(user):
     return rows, me, rank, len(rows), None
 
 
+_NEG_INTERVAL = None  # cached NEGOTIATOR_INTERVAL config value
+
+
+def negotiator_interval():
+    global _NEG_INTERVAL
+    if _NEG_INTERVAL is None:
+        out, _e = run(["condor_config_val", "NEGOTIATOR_INTERVAL"], timeout=15)
+        try:
+            _NEG_INTERVAL = int((out or "").strip())
+        except (ValueError, AttributeError):
+            _NEG_INTERVAL = 60
+    return _NEG_INTERVAL
+
+
+def collect_negotiator():
+    """Most recent negotiation cycle timing -> dict(start, end, period, dur, interval)."""
+    out, err = run(["condor_status", "-negotiator", "-af:t",
+                    "LastNegotiationCycleTime0", "LastNegotiationCycleEnd0",
+                    "LastNegotiationCyclePeriod0", "LastNegotiationCycleDuration0"],
+                   timeout=30)
+    if err:
+        return {}, err
+    best = None
+    for line in (out or "").splitlines():
+        p = line.split("\t")
+        if len(p) < 2:
+            continue
+        start = _num(p[0])
+        if start and (best is None or start > best["start"]):
+            best = {"start": start, "end": _num(p[1]),
+                    "period": _num(p[2]) if len(p) > 2 else 0,
+                    "dur": _num(p[3]) if len(p) > 3 else 0}
+    if not best:
+        return {}, None
+    best["interval"] = negotiator_interval()
+    return best, None
+
+
+def next_negotiation(neg):
+    """Estimated seconds until the next negotiation cycle (a live, repeating count).
+
+    The collector's negotiator ad can lag real time by minutes, so rather than
+    `last_start + interval` (which would get stuck in the past), we project the
+    cadence forward by phase: cycles recur ~every NEGOTIATOR_INTERVAL, aligned to
+    the last observed cycle start. Cycles can also fire early via condor_reschedule,
+    so this is an estimate / upper bound, not an exact deadline."""
+    if not neg or not neg.get("start"):
+        return None
+    interval = neg.get("interval") or 60
+    if interval <= 0:
+        return None
+    elapsed = time.time() - neg["start"]
+    if elapsed < 0:  # clock skew between us and the negotiator
+        return interval
+    return interval - (elapsed % interval)
+
+
 ANALYZE_CAP = 60  # bound match analysis cost when the queue is huge
 
 
@@ -529,10 +586,14 @@ def gather(user):
     cluster, open_slots, cap, cerr = collect_cluster()
     gpu_nodes, gerr = collect_gpu_nodes()
     idle, ierr = collect_idle_jobs()
+    neg, nerr = collect_negotiator()
     prows, pme, prank, ptot, perr = collect_priority(user)
 
-    # estimate match likelihood for each idle job (user's first, then longest waiting)
-    idle.sort(key=lambda j: (j["owner"] != user, -(j["wait"] or 0)))
+    # order the queue the way the negotiator serves it: by the owner's effective
+    # priority (lower == served first), then longest waiting. Your own jobs are
+    # highlighted in the panel so they stay easy to spot wherever priority lands them.
+    prio = {r["user"]: r["eff"] for r in prows}
+    idle.sort(key=lambda j: (prio.get(j["owner"], float("inf")), -(j["wait"] or 0)))
     for j in idle[:ANALYZE_CAP]:
         j["match"] = analyze_idle(j, gpu_nodes, open_slots, cap)
     for j in idle[ANALYZE_CAP:]:
@@ -544,6 +605,7 @@ def gather(user):
         "cluster": cluster, "open_slots": open_slots, "cap": cap, "cerr": cerr,
         "gpu_nodes": gpu_nodes, "gerr": gerr,
         "idle": idle, "ierr": ierr,
+        "neg": neg, "nerr": nerr,
         "prows": prows, "pme": pme, "prank": prank, "ptot": ptot, "perr": perr,
         "ts": time.time(),
     }
@@ -608,6 +670,25 @@ def panel_priority(st, user, width):
     ]
 
 
+def negotiation_line(st):
+    """Compact, live countdown to the next negotiation cycle (idle jobs match then)."""
+    if st.get("nerr") or not st.get("neg"):
+        return "   " + paint("next negotiation cycle: n/a", "dim")
+    neg = st["neg"]
+    rem = next_negotiation(neg)
+    if rem is None:
+        return "   " + paint("next negotiation cycle: n/a", "dim")
+    if rem > 1:
+        when = paint("in ~%s" % fmt_dur(rem), "bold", "bcyan")
+    else:
+        when = paint("due now — matching…", "bold", "byellow")
+    detail = "every %ds" % (neg.get("interval") or 60)
+    if neg.get("dur"):
+        detail += ", last took %ds" % neg["dur"]
+    return "   %s %s   %s" % (
+        paint("next negotiation cycle", "white"), when, paint("(" + detail + ")", "dim"))
+
+
 def panel_cluster(st, user, width):
     if st["cerr"]:
         return [paint("error: " + st["cerr"], "red")]
@@ -630,27 +711,49 @@ def panel_cluster(st, user, width):
         free += paint("      queue: %d run · %d idle · %d held" % (
             q["running"], q["idle"], q["held"]), "dim")
     body.append(free)
+    body.append(negotiation_line(st))
     return body
+
+
+def group_gpu_nodes(nodes):
+    """Group GPU nodes by CUDA device model; return groups sorted by free GPUs."""
+    groups = {}
+    for n in nodes:
+        g = groups.get(n[5])
+        if g is None:
+            g = groups[n[5]] = {"model": n[5], "vram": n[6], "nodes": [],
+                                "free_g": 0, "total_g": 0, "cpus": set()}
+        g["nodes"].append(n)
+        g["free_g"] += n[1]
+        g["total_g"] += n[2]
+        g["cpus"].add(n[7])
+    for g in groups.values():
+        g["free_nodes"] = sum(1 for n in g["nodes"] if n[1] > 0)
+        g["nodes"].sort(key=lambda x: (-x[1], x[0]))
+    return sorted(groups.values(), key=lambda x: (-x["free_g"], -x["total_g"]))
 
 
 def panel_freegpu(st, user, width):
     if st["gerr"]:
         return [paint("error: " + st["gerr"], "red")]
-    free = [n for n in st["gpu_nodes"] if n[1] > 0]
-    if not free:
-        return [paint("No GPUs free right now.", "bred")]
-    cells = [paint("%-15s %d/%d gpu %dc free" % (n[0], n[1], n[2], n[3]), "bgreen")
-             for n in free[:10]]
-    half = (len(cells) + 1) // 2
-    colw = (width - 5) // 2
-    body = []
-    for i in range(half):
-        l = cells[i]
-        r = cells[i + half] if i + half < len(cells) else ""
-        body.append(" " + l + " " * max(0, colw - vis_len(l)) + " " + r)
-    if len(free) > 10:
-        body.append(paint("  … %d more nodes with free GPUs (Enter to see all)" % (
-            len(free) - 10), "dim"))
+    nodes = st["gpu_nodes"]
+    if not nodes:
+        return [paint("No GPU nodes found.", "dim")]
+    groups = group_gpu_nodes(nodes)
+    inner = width - 4
+    body = [paint(fit(" %-18s %5s %6s %6s %11s %6s" % (
+        "GPU MODEL", "FREE", "TOTAL", "NODES", "FREE NODES", "VRAM"), inner), "dim")]
+    for g in groups:
+        row = " %-18s %5d %6d %6d %11d %6s" % (
+            g["model"][:18], g["free_g"], g["total_g"], len(g["nodes"]),
+            g["free_nodes"], fmt_mem(g["vram"]))
+        body.append(paint(fit(row, inner), "bgreen") if g["free_g"]
+                     else paint(fit(row, inner), "dim"))
+    tf = sum(g["free_g"] for g in groups)
+    tg = sum(g["total_g"] for g in groups)
+    tn = sum(len(g["nodes"]) for g in groups)
+    body.append(paint(fit(" %-18s %5d %6d %6d  (Enter for per-node list)" % (
+        "TOTAL", tf, tg, tn), inner), "bold"))
     return body
 
 
@@ -691,9 +794,12 @@ def _need_str(j):
 
 
 def _queued_row(j, user, inner):
-    """One overview row: plain 'head' + colored, width-bounded match cell."""
-    head = " %-11s %-10s %-19s %7s  " % (
-        j["id"], j["owner"][:10], _need_str(j)[:19],
+    """One overview row: plain 'head' + colored, width-bounded match cell.
+
+    Your own jobs get a leading ▸ marker and a bright-cyan head."""
+    mine = j["owner"] == user
+    head = "%s%-11s %-10s %-19s %7s  " % (
+        "▸" if mine else " ", j["id"], j["owner"][:10], _need_str(j)[:19],
         fmt_dur(j["wait"]) if j["wait"] is not None else "-")
     label, color, reason = j.get("match") or ("?", "dim", "")
     avail = max(6, inner - len(head))
@@ -701,7 +807,7 @@ def _queued_row(j, user, inner):
         cell = paint(label, "bold", color) + " " + paint(reason[:avail - len(label) - 1], "dim")
     else:
         cell = paint(label[:avail], "bold", color)
-    return paint(head, "bold", "bcyan") + cell if j["owner"] == user else head + cell
+    return paint(head, "bold", "bcyan") + cell if mine else head + cell
 
 
 def panel_queued(st, user, width):
@@ -824,34 +930,47 @@ def detail_cluster(st, user, width):
             q["total"], paint(str(q["running"]), "bgreen"),
             paint(str(q["idle"]), "yellow"), paint(str(q["held"]), "bred")))
         out.append("   %d users with running jobs" % runners)
+    out.append("")
+    out.append(paint(" NEGOTIATOR", "bold", "bcyan"))
+    out.append(negotiation_line(st))
+    if not st.get("nerr") and st.get("neg"):
+        neg = st["neg"]
+        out.append("   last cycle ended %s · duration %ds · observed period %ds" % (
+            fmt_when(neg.get("end")), neg.get("dur", 0), neg.get("period", 0)))
+        out.append(paint("   idle jobs are matched to slots once per cycle; "
+                         "early cycles can be triggered by job activity.", "dim"))
     return out
 
 
 def detail_freegpu(st, user, width):
     if st["gerr"]:
         return [paint("error: " + st["gerr"], "red")]
-    free = [n for n in st["gpu_nodes"] if n[1] > 0]
-    if not free:
-        return [paint("No GPUs free right now.", "bred")]
-    # free GPUs per model, most plentiful first
-    by_model = {}
-    for n in free:
-        by_model[n[5]] = by_model.get(n[5], 0) + n[1]
-    summary = " · ".join("%s ×%d" % (m, c) for m, c in
-                         sorted(by_model.items(), key=lambda kv: -kv[1]))
+    nodes = st["gpu_nodes"]
+    if not nodes:
+        return [paint("No GPU nodes found.", "dim")]
+    groups = group_gpu_nodes(nodes)
+    tf = sum(g["free_g"] for g in groups)
+    tg = sum(g["total_g"] for g in groups)
     out = [
-        paint(" %d nodes have free GPUs (%d GPUs free total)" % (
-            len(free), sum(n[1] for n in free)), "bgreen"),
-        paint(fit(" free by model:  " + summary, width), "dim"),
+        paint(" %d GPUs free / %d total   across %d nodes in %d models" % (
+            tf, tg, len(nodes), len(groups)), "bold", "bgreen"),
+        paint(" Grouped by GPU model — free nodes first, busy nodes dimmed."
+              "  Scroll: ↑/↓ · PgUp/PgDn · g/G", "dim"),
         "",
-        paint(" %-18s %8s  %-15s %6s  %-16s %8s %8s" % (
-            "NODE", "GPU free", "CUDA DEVICE", "VRAM", "CPU MODEL",
-            "CPU free", "MEM free"), "bold", "dim"),
+        paint(" %-20s %8s  %-16s %8s %9s" % (
+            "NODE", "GPUs", "CPU MODEL", "CPU free", "MEM free"), "bold", "dim"),
     ]
-    for name, gfree, gtot, cpus, mem, model, vram, cpu in free:
-        out.append(fit(" %-18s %8s  %-15s %6s  %-16s %7dc %8s" % (
-            name, "%d/%d" % (gfree, gtot), model[:15], fmt_mem(vram),
-            cpu[:16], cpus, fmt_mem(mem)), width))
+    for g in groups:
+        free_g, total_g, nfree, nall = g["free_g"], g["total_g"], g["free_nodes"], len(g["nodes"])
+        title = " ◆ %s   %s VRAM   —   %d/%d GPUs free · %d/%d nodes free" % (
+            g["model"], fmt_mem(g["vram"]), free_g, total_g, nfree, nall)
+        out.append(paint(fit(title, width), "bold", "byellow" if free_g else "dim"))
+        for name, gfree, gtot, fcpu, fmem, _m, _v, cpu in g["nodes"]:
+            row = "   %-20s %8s  %-16s %7dc %9s" % (
+                name, "%d/%d" % (gfree, gtot), cpu[:16], fcpu, fmt_mem(fmem))
+            out.append(paint(fit(row, width), "bgreen") if gfree
+                       else paint(fit(row, width), "dim"))
+        out.append("")
     return out
 
 
@@ -903,6 +1022,7 @@ def detail_queued(st, user, width):
         paint(" Estimate from current free resources + each job's Requirements"
               " (CPU/GPU/VRAM/model/host).", "dim"),
         paint(" It ignores user priority, preemption, disk and rank — treat it as a guide.", "dim"),
+        paint(" Rows are ordered by owner priority (served-first); your jobs are marked ▸.", "dim"),
         "",
         paint(" %-11s %-10s %4s %4s %-13s %7s %7s  %s" % (
             "JOB", "OWNER", "CPU", "GPU", "GPU/HOST REQ", "MEM", "WAIT",
@@ -912,8 +1032,9 @@ def detail_queued(st, user, width):
         req = j["model"] or (("≥%s" % fmt_mem(j["vram"])) if j["vram"] else "")
         if j["host"]:
             req = (req + " @" + j["host"]).strip()
-        head = " %-11s %-10s %4d %4s %-13s %7s %7s  " % (
-            j["id"], j["owner"][:10], j["cpu"], (j["gpu"] or "-"),
+        mine = j["owner"] == user
+        head = "%s%-11s %-10s %4d %4s %-13s %7s %7s  " % (
+            "▸" if mine else " ", j["id"], j["owner"][:10], j["cpu"], (j["gpu"] or "-"),
             (req or "-")[:13], fmt_mem(j["mem"]),
             fmt_dur(j["wait"]) if j["wait"] is not None else "-")
         avail = max(8, width - len(head))
@@ -922,7 +1043,7 @@ def detail_queued(st, user, width):
             cell = paint(label, "bold", color) + " " + paint(reason[:avail - len(label) - 1], "dim")
         else:
             cell = paint(label[:avail], "bold", color)
-        row = paint(head, "bold", "bcyan") if j["owner"] == user else head
+        row = paint(head, "bold", "bcyan") if mine else head
         out.append(row + cell)
     return out
 

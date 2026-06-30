@@ -6,23 +6,38 @@ An **interactive** terminal dashboard for HTCondor users. One screen answers:
 
 - **My jobs** — what's running/idle/held, on which GPU node, CPU/GPU each, runtime
 - **My priority** — your effective priority and rank among active users (lower = served first)
-- **Cluster load** — CPU cores and GPUs in use vs. total, with load bars
-- **Free GPUs** — how many are free and exactly which nodes have them
+- **Cluster load** — CPU cores and GPUs in use vs. total, with load bars, plus a live countdown to the next negotiation cycle
+- **Free GPUs** — free vs. total GPUs grouped by GPU model; expand for the per-node breakdown
 - **Top users** — who is using how many CPUs/GPUs right now (you are highlighted)
 - **Queued jobs** — every idle job, its requirements, and an estimate of how likely it is to match
 
 Pure standard-library Python 3 — no `pip install`, no Python bindings, works over SSH.
 It shells out to `condor_q`, `condor_status`, and `condor_userprio`.
 
+## Install
+
+A small bash launcher, `condor_gui`, boots the dashboard from anywhere on your
+`PATH`. Symlink it into a directory already on your `PATH`:
+
+```bash
+ln -sf "$PWD/condor_gui" ~/.local/bin/condor_gui   # ~/.local/bin must be on $PATH
+condor_gui                                          # now just works
+```
+
+The launcher finds `condor_dash.py` next to itself (following the symlink),
+picks a Python 3 interpreter, and forwards any arguments to the dashboard.
+
 ## Usage
 
 ```bash
-./condor_dash.py                 # live dashboard, refresh every 5s
-./condor_dash.py --once          # print a single snapshot and exit
-./condor_dash.py --interval 10   # live, custom refresh interval (seconds)
-./condor_dash.py --user someone  # inspect another user's jobs & priority
-./condor_dash.py --no-color      # plain text (good for logging / piping)
+condor_gui                       # live dashboard, refresh every 5s
+condor_gui --once                # print a single snapshot and exit
+condor_gui --interval 10         # live, custom refresh interval (seconds)
+condor_gui --user someone        # inspect another user's jobs & priority
+condor_gui --no-color            # plain text (good for logging / piping)
 ```
+
+(You can still run `./condor_dash.py` directly with the same flags.)
 
 ### Navigating the live dashboard
 
@@ -43,8 +58,8 @@ terminals too. Each block expands to more than the overview shows:
 
 - **My jobs** → every job with memory, full node, submit time, full command, and hold reasons
 - **My priority** → the full ranked table of active users (you highlighted)
-- **Cluster load** → CPU/GPU/slot breakdown, GPU-node counts (fully/partially free), queue stats
-- **Free GPU nodes** → all nodes with free GPUs, incl. CUDA device, per-GPU VRAM, CPU model, free CPU & memory
+- **Cluster load** → CPU/GPU/slot breakdown, GPU-node counts (fully/partially free), queue stats, negotiator timing
+- **Free GPU nodes** → every GPU node grouped by model (free first, busy dimmed), incl. per-GPU VRAM, CPU model, free CPU & memory — scroll with ↑/↓ · PgUp/PgDn · g/G
 - **Top users** → every user in the queue with running CPU/GPU and idle counts, plus totals
 - **Queued jobs** → every idle job with its CPU/GPU/VRAM/host requirements and a match verdict
 
@@ -60,5 +75,10 @@ terminals too. Each block expands to more than the overview shows:
   or rank — so treat it as a guide, and use `condor_q <id> -analyze` for the authoritative
   (but slow) answer. CPU models are decoded from CPUID family/model since the pool does
   not advertise a CPU model string.
+- The **next-negotiation countdown** is an estimate: the negotiator's collector ad
+  can lag real time, so the cadence is projected forward by phase from the last
+  observed cycle using `NEGOTIATOR_INTERVAL`. Cycles can also fire early (e.g. via
+  `condor_reschedule`), so treat it as an upper bound — idle jobs are matched to
+  slots once per cycle.
 - Each refresh runs a handful of quick condor queries (~1-2s total on this pool).
   Raise `--interval` if you want to query the schedd less often.

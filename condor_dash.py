@@ -41,6 +41,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 # ---------------------------------------------------------------------------
@@ -49,6 +50,11 @@ import time
 
 _ANSI_RE = re.compile(r"\033\[[0-9;?]*[A-Za-z]")
 USE_COLOR = True
+
+# Marks a slice of dashboard state whose collector has not finished yet. gather()
+# starts every key PENDING and fills each in as its collector returns, so panels
+# can paint "loading" for what isn't ready instead of blocking the whole frame.
+PENDING = object()
 
 C = {
     "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m", "rev": "\033[7m",
@@ -138,6 +144,43 @@ def run(args, timeout=30):
         msg = (p.stderr or "").strip().splitlines()
         return None, msg[0] if msg else "exit %d" % p.returncode
     return p.stdout, None
+
+
+def run_many(cmd_list, timeout=60):
+    """Launch several commands at once; return [(stdout, err), …] in order.
+
+    Used to fan out a per-schedd condor_q across the pool's ~12 schedds. They
+    all run concurrently, so wall time is roughly the slowest single query
+    rather than their sum. A command that fails or is unreachable comes back
+    as (None, err) so callers can treat that schedd as count-only."""
+    procs = []
+    for args in cmd_list:
+        try:
+            procs.append((args, subprocess.Popen(
+                args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
+        except Exception as exc:  # pragma: no cover - defensive
+            procs.append((args, exc))
+    results = []
+    for args, p in procs:
+        if isinstance(p, Exception):
+            results.append((None, str(p)))
+            continue
+        try:
+            out, errtxt = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            try:
+                p.communicate(timeout=5)
+            except Exception:
+                pass
+            results.append((None, "%s timed out" % args[0]))
+            continue
+        if p.returncode != 0 and not (out or "").strip():
+            msg = (errtxt or "").strip().splitlines()
+            results.append((None, msg[0] if msg else "exit %d" % p.returncode))
+        else:
+            results.append((out, None))
+    return results
 
 
 JOB_STATUS = {
@@ -254,34 +297,55 @@ def collect_my_jobs(user):
 
 
 def collect_queue_and_users():
-    out, err = run(["condor_q", "-all", "-af:t", "Owner", "JobStatus",
-                    "RequestCpus", "RequestGpus"], timeout=60)
+    """Per-user *actual* usage + pool-wide queue totals, from the machine side.
+
+    We deliberately do NOT use condor_q here. This pool has ~12 separate
+    schedds (its-og-login*, sugwg-login*, lhcb-login, the CE nodes, …), and
+    `condor_q` without -global only sees the one local schedd, so it misses
+    almost everyone. `condor_q -global` is slow (~12s), fails to authenticate
+    to the CE schedds, and its RequestGpus attribute is unset on most jobs
+    anyway (a job can show gpu=0 in the queue while really running 90+ GPUs).
+
+    The execute nodes, by contrast, report the real owner and real CPU/GPU
+    allocation of every claimed slot to the collector — one fast, complete,
+    accurate query. Queue run/idle/held totals come from each schedd's own
+    counters (TotalRunningJobs/…), also a single fast collector query.
+
+    users: {owner: {jobs, cpu, gpu}}  actual running usage across the pool
+    q:     {running, idle, held, total}  summed over every schedd
+    """
+    out, err = run(["condor_status", "-af:t",
+                    "RemoteOwner", "Cpus", "GPUs", "State"], timeout=60)
     if err:
         return {}, {}, err
     users = {}
-    q = {"running": 0, "idle": 0, "held": 0, "other": 0, "total": 0}
     for line in (out or "").splitlines():
         parts = line.split("\t")
-        if len(parts) < 4:
+        if len(parts) < 4 or parts[3] != "Claimed":
             continue
-        owner, st = parts[0], _num(parts[1], -1)
-        if st < 0:
+        owner = parts[0]
+        if owner in ("undefined", "", None):
             continue
-        q["total"] += 1
-        u = users.setdefault(owner, {"jobs": 0, "cpu": 0, "gpu": 0, "idle": 0})
-        if st == 2:
-            q["running"] += 1
-            u["jobs"] += 1
-            u["cpu"] += _num(parts[2])
-            u["gpu"] += _num(parts[3])
-        elif st == 1:
-            q["idle"] += 1
-            u["idle"] += 1
-        elif st == 5:
-            q["held"] += 1
-        else:
-            q["other"] += 1
-    users = {k: v for k, v in users.items() if v["jobs"] or v["idle"]}
+        owner = owner.split("@", 1)[0]          # strip the UID domain
+        u = users.setdefault(owner, {"jobs": 0, "cpu": 0, "gpu": 0})
+        u["jobs"] += 1                            # one claimed slot ≈ one running job
+        u["cpu"] += _num(parts[1])
+        if parts[2] not in ("undefined", "", None):
+            u["gpu"] += _num(parts[2])
+
+    # pool-wide queue totals: sum each schedd's own job counters (fast, complete)
+    q = {"running": 0, "idle": 0, "held": 0, "total": 0}
+    sout, _se = run(["condor_status", "-schedd", "-af:t",
+                     "TotalRunningJobs", "TotalIdleJobs", "TotalHeldJobs"],
+                    timeout=30)
+    for line in (sout or "").splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        q["running"] += _num(parts[0])
+        q["idle"] += _num(parts[1])
+        q["held"] += _num(parts[2])
+    q["total"] = q["running"] + q["idle"] + q["held"]
     return users, q, None
 
 
@@ -405,42 +469,96 @@ def parse_requirements(req):
             "host": h.group(1) if h else None}
 
 
-def collect_idle_jobs():
-    """Pool-wide idle jobs with their resource requests and parsed Requirements.
+PER_USER_CAP = 20  # keep at most this many idle jobs per user in the queue view
 
-    Two queries: numeric fields *evaluated* (-af:t) for correct numbers, and the
-    Requirements expression *raw* (-af:tr); merged by job id."""
-    base, err = run([
-        "condor_q", "-all", "-constraint", "JobStatus==1", "-af:t",
-        "ClusterId", "ProcId", "Owner", "RequestCpus", "RequestGpus",
-        "RequestMemory", "QDate", "ServerTime",
-    ], timeout=60)
-    if err:
-        return [], err
-    reqs, _e = run([
-        "condor_q", "-all", "-constraint", "JobStatus==1", "-af:tr",
-        "ClusterId", "ProcId", "Requirements",
-    ], timeout=60)
-    rmap = {}
-    for line in (reqs or "").splitlines():
+
+def collect_idle_jobs():
+    """Pool-wide idle jobs, gathered by fanning out across every schedd.
+
+    A bare `condor_q` only talks to the *local* schedd, so it misses the ~11
+    other schedds in this pool (this dashboard used to show only local-schedd
+    idle jobs while the CLUSTER panel reported the pool-wide count — the two
+    never agreed). Instead we list the schedds from the collector and query
+    each one that has idle jobs *by name, in parallel*. Schedds we can't read
+    (the CE nodes reject the query, exactly as `-global` does) contribute only
+    their idle count, surfaced to the user as "count only".
+
+    When one user submits a huge array (tens of thousands of jobs is normal
+    here) we keep at most PER_USER_CAP of their jobs so the panel stays legible,
+    and report the remainder as a per-owner overflow.
+
+    Returns (jobs, meta, err). meta = {total, enumerated, shown, unreachable,
+    overflow{owner:n}, users} carries the headline numbers and the overflow the
+    panels annotate with."""
+    sout, serr = run(["condor_status", "-schedd", "-af:t",
+                      "Name", "TotalIdleJobs"], timeout=30)
+    if serr:
+        return [], {}, serr
+    schedds, total = [], 0                    # [(name, idle_count)], pool total
+    for line in (sout or "").splitlines():
         p = line.split("\t")
-        if len(p) >= 3:
-            rmap["%s.%s" % (p[0], p[1])] = p[2]
-    jobs = []
-    for line in (base or "").splitlines():
-        p = line.split("\t")
-        if len(p) < 8:
+        if len(p) < 2:
             continue
-        jid = "%s.%s" % (p[0], p[1])
-        srv, qd = _num(p[7]), _num(p[6])
-        req = parse_requirements(rmap.get(jid, ""))
-        jobs.append({
-            "id": jid, "owner": p[2],
-            "cpu": _num(p[3]), "gpu": _num(p[4]), "mem": _num(p[5]),
-            "wait": (srv - qd) if (srv and qd) else None,
-            "model": req["model"], "vram": req["vram"], "host": req["host"],
-        })
-    return jobs, None
+        schedds.append((p[0], _num(p[1])))
+        total += _num(p[1])
+
+    # pull idle jobs from every schedd that claims to have any, all at once
+    targets = [(name, cnt) for name, cnt in schedds if cnt > 0]
+    base_res = run_many([
+        ["condor_q", "-name", name, "-all", "-constraint", "JobStatus==1",
+         "-af:t", "ClusterId", "ProcId", "Owner", "RequestCpus", "RequestGpus",
+         "RequestMemory", "QDate", "ServerTime"] for name, _ in targets
+    ], timeout=60)
+
+    by_owner = {}                             # owner -> [job dicts] (pre-cap)
+    enumerated = unreachable = 0
+    for (name, cnt), (out, e) in zip(targets, base_res):
+        if e:
+            unreachable += cnt                # rejected us (the CE nodes reject
+            continue                          # this query the same way -global does)
+        for line in (out or "").splitlines():
+            p = line.split("\t")
+            if len(p) < 8:
+                continue
+            srv, qd = _num(p[7]), _num(p[6])
+            by_owner.setdefault(p[2], []).append({
+                "id": "%s.%s" % (p[0], p[1]), "owner": p[2], "schedd": name,
+                "cpu": _num(p[3]), "gpu": _num(p[4]), "mem": _num(p[5]),
+                "wait": (srv - qd) if (srv and qd) else None,
+                "model": None, "vram": 0, "host": None,
+            })
+            enumerated += 1
+
+    # cap each user to their longest-waiting PER_USER_CAP jobs; record the rest
+    kept, overflow = [], {}
+    for owner, jl in by_owner.items():
+        jl.sort(key=lambda x: -(x["wait"] or 0))
+        if len(jl) > PER_USER_CAP:
+            overflow[owner] = len(jl) - PER_USER_CAP
+        kept.extend(jl[:PER_USER_CAP])
+
+    # fetch Requirements only for the jobs we kept (≤ a few hundred), per schedd
+    per_schedd = {}
+    for j in kept:
+        per_schedd.setdefault(j["schedd"], []).append(j["id"])
+    if per_schedd:
+        rmap = {}
+        for out, _e in run_many([
+            ["condor_q", "-name", s, "-af:tr", "ClusterId", "ProcId",
+             "Requirements"] + ids for s, ids in per_schedd.items()
+        ], timeout=60):
+            for line in (out or "").splitlines():
+                p = line.split("\t")
+                if len(p) >= 3:
+                    rmap["%s.%s" % (p[0], p[1])] = p[2]
+        for j in kept:
+            r = parse_requirements(rmap.get(j["id"], ""))
+            j["model"], j["vram"], j["host"] = r["model"], r["vram"], r["host"]
+
+    meta = {"total": total, "enumerated": enumerated, "shown": len(kept),
+            "unreachable": unreachable, "overflow": overflow,
+            "users": len(by_owner)}
+    return kept, meta, None
 
 
 def analyze_idle(job, gpu_nodes, open_slots, cap):
@@ -579,43 +697,109 @@ def next_negotiation(neg):
 ANALYZE_CAP = 60  # bound match analysis cost when the queue is huge
 
 
-def gather(user):
-    """Run every collector once; return a single cached state dict."""
-    jobs, jsumm, jerr = collect_my_jobs(user)
-    users, queue, uerr = collect_queue_and_users()
-    cluster, open_slots, cap, cerr = collect_cluster()
-    gpu_nodes, gerr = collect_gpu_nodes()
-    idle, ierr = collect_idle_jobs()
-    neg, nerr = collect_negotiator()
-    prows, pme, prank, ptot, perr = collect_priority(user)
+# Every key a panel might read. gather() seeds them all PENDING and fills each
+# in as its collector returns, so a fresh (or partial) state never KeyErrors.
+_STATE_KEYS = (
+    "jobs", "jsumm", "jerr", "users", "queue", "uerr",
+    "cluster", "open_slots", "cap", "cerr", "gpu_nodes", "gerr",
+    "idle", "idle_meta", "ierr", "neg", "nerr",
+    "prows", "pme", "prank", "ptot", "perr",
+)
 
-    # order the queue the way the negotiator serves it: by the owner's effective
-    # priority (lower == served first), then longest waiting. Your own jobs are
-    # highlighted in the panel so they stay easy to spot wherever priority lands them.
-    prio = {r["user"]: r["eff"] for r in prows}
+
+def new_state():
+    """A blank state with every collector slice marked not-yet-loaded."""
+    st = {k: PENDING for k in _STATE_KEYS}
+    st["ts"] = time.time()
+    return st
+
+
+def gather(user, publish=None):
+    """Run every collector concurrently into one state dict.
+
+    The collectors are independent and network-bound, so running them on
+    separate threads makes wall time the slowest single collector (idle-job
+    discovery fans condor_q across ~12 schedds and dominates at ~10s+) rather
+    than their sum. As each finishes we call publish(snapshot) with a copy of
+    the state so far, letting the dashboard paint the fast panels (jobs,
+    priority, load, GPUs, users) within a second while the slow QUEUED panel
+    still shows "loading". Without a publish callback it simply returns the
+    final state, so --once and the non-interactive loop are unaffected."""
+    state = new_state()
+    lock = threading.Lock()
+
+    def emit(update):
+        with lock:
+            state.update(update)
+            snap = dict(state)
+        if publish:
+            publish(snap)
+
+    def collector(fn, keys, err_key, err_defaults):
+        def run_it():
+            try:
+                emit(dict(zip(keys, fn())))
+            except Exception as exc:            # keep the panel usable on a crash
+                upd = dict(err_defaults)
+                upd[err_key] = str(exc)
+                emit(upd)
+        return run_it
+
+    tasks = [
+        collector(lambda: collect_my_jobs(user),
+                  ("jobs", "jsumm", "jerr"), "jerr", {"jobs": [], "jsumm": {}}),
+        collector(collect_queue_and_users,
+                  ("users", "queue", "uerr"), "uerr", {"users": {}, "queue": {}}),
+        collector(collect_cluster,
+                  ("cluster", "open_slots", "cap", "cerr"), "cerr",
+                  {"cluster": {}, "open_slots": [], "cap": []}),
+        collector(collect_gpu_nodes,
+                  ("gpu_nodes", "gerr"), "gerr", {"gpu_nodes": []}),
+        collector(collect_idle_jobs,
+                  ("idle", "idle_meta", "ierr"), "ierr", {"idle": [], "idle_meta": {}}),
+        collector(collect_negotiator, ("neg", "nerr"), "nerr", {"neg": {}}),
+        collector(lambda: collect_priority(user),
+                  ("prows", "pme", "prank", "ptot", "perr"), "perr",
+                  {"prows": [], "pme": None, "prank": None, "ptot": None}),
+    ]
+    threads = [threading.Thread(target=t, daemon=True) for t in tasks]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    # With priority + cluster + GPU data all in, order the queue the way the
+    # negotiator serves it (owner effective priority, then longest waiting) and
+    # estimate each job's match. Republish so the QUEUED panel gets sorted,
+    # analyzed rows. Your own jobs are highlighted in the panel regardless.
+    def val(k, empty):
+        v = state[k]
+        return v if v is not PENDING else empty
+
+    idle = val("idle", [])
+    prio = {r["user"]: r["eff"] for r in val("prows", [])}
     idle.sort(key=lambda j: (prio.get(j["owner"], float("inf")), -(j["wait"] or 0)))
+    gpu_nodes, open_slots, cap = val("gpu_nodes", []), val("open_slots", []), val("cap", [])
     for j in idle[:ANALYZE_CAP]:
         j["match"] = analyze_idle(j, gpu_nodes, open_slots, cap)
     for j in idle[ANALYZE_CAP:]:
         j["match"] = None
-
-    return {
-        "jobs": jobs, "jsumm": jsumm, "jerr": jerr,
-        "users": users, "queue": queue, "uerr": uerr,
-        "cluster": cluster, "open_slots": open_slots, "cap": cap, "cerr": cerr,
-        "gpu_nodes": gpu_nodes, "gerr": gerr,
-        "idle": idle, "ierr": ierr,
-        "neg": neg, "nerr": nerr,
-        "prows": prows, "pme": pme, "prank": prank, "ptot": ptot, "perr": perr,
-        "ts": time.time(),
-    }
+    emit({"idle": idle})
+    return state
 
 
 # ---------------------------------------------------------------------------
 # Overview panels (compact)
 # ---------------------------------------------------------------------------
 
+def _loading_body():
+    """Placeholder shown in a panel whose collector hasn't returned yet."""
+    return [paint("  ⟳ loading…", "dim")]
+
+
 def panel_jobs(st, user, width):
+    if st["jobs"] is PENDING:
+        return _loading_body()
     body = []
     if st["jerr"]:
         return [paint("error: " + st["jerr"], "red")]
@@ -642,7 +826,7 @@ def panel_jobs(st, user, width):
 
 def panel_jobs_title(st):
     s = st["jsumm"]
-    if not s:
+    if s is PENDING or not s:
         return "MY JOBS"
     return "MY JOBS   %d running · %d idle · %d held   %d CPU · %d GPU in use" % (
         s.get("running", 0), s.get("idle", 0), s.get("held", 0),
@@ -650,6 +834,8 @@ def panel_jobs_title(st):
 
 
 def panel_priority(st, user, width):
+    if st["perr"] is PENDING:
+        return _loading_body()
     if st["perr"]:
         return [paint("error: " + st["perr"], "red")]
     me, rank, total = st["pme"], st["prank"], st["ptot"]
@@ -672,6 +858,8 @@ def panel_priority(st, user, width):
 
 def negotiation_line(st):
     """Compact, live countdown to the next negotiation cycle (idle jobs match then)."""
+    if st.get("neg") is PENDING or st.get("nerr") is PENDING:
+        return "   " + paint("next negotiation cycle: loading…", "dim")
     if st.get("nerr") or not st.get("neg"):
         return "   " + paint("next negotiation cycle: n/a", "dim")
     neg = st["neg"]
@@ -690,6 +878,8 @@ def negotiation_line(st):
 
 
 def panel_cluster(st, user, width):
+    if st["cerr"] is PENDING:
+        return _loading_body()
     if st["cerr"]:
         return [paint("error: " + st["cerr"], "red")]
     cl, q = st["cluster"], st["queue"]
@@ -734,6 +924,8 @@ def group_gpu_nodes(nodes):
 
 
 def panel_freegpu(st, user, width):
+    if st["gpu_nodes"] is PENDING:
+        return _loading_body()
     if st["gerr"]:
         return [paint("error: " + st["gerr"], "red")]
     nodes = st["gpu_nodes"]
@@ -758,6 +950,8 @@ def panel_freegpu(st, user, width):
 
 
 def panel_users(st, user, width):
+    if st["users"] is PENDING:
+        return _loading_body()
     if st["uerr"]:
         return [paint("error: " + st["uerr"], "red")]
     users = st["users"]
@@ -810,11 +1004,45 @@ def _queued_row(j, user, inner):
     return paint(head, "bold", "bcyan") + cell if mine else head + cell
 
 
+def _queue_overflow_notes(st, itemize):
+    """Dim '… N more' lines explaining what the capped list can't show:
+    per-user overflow (bulk arrays) and idle jobs on schedds we couldn't read.
+
+    itemize=True lists every over-cap user (detail view); False rolls them into
+    one line (compact panel)."""
+    meta = st.get("idle_meta") or {}
+    notes = []
+    ov = sorted((meta.get("overflow") or {}).items(), key=lambda kv: -kv[1])
+    if itemize:
+        for owner, n in ov:
+            notes.append(paint("  … %d more from %s (capped at %d/user)"
+                               % (n, owner, PER_USER_CAP), "dim"))
+    elif ov:
+        extra = sum(n for _, n in ov)
+        if len(ov) == 1:
+            notes.append(paint("  … %d more from %s (capped at %d/user)"
+                               % (extra, ov[0][0], PER_USER_CAP), "dim"))
+        else:
+            notes.append(paint("  … %d more from %d users over the %d/user cap"
+                               % (extra, len(ov), PER_USER_CAP), "dim"))
+    un = meta.get("unreachable", 0)
+    if un:
+        notes.append(paint("  … %d more on CE / unreachable schedds — count only"
+                           % un, "dim"))
+    return notes
+
+
 def panel_queued(st, user, width):
+    if st["idle"] is PENDING:
+        return _loading_body()
     if st["ierr"]:
         return [paint("error: " + st["ierr"], "red")]
     idle = st["idle"]
+    meta = st.get("idle_meta") or {}
     if not idle:
+        if meta.get("unreachable"):
+            return [paint("No readable idle jobs — %d on CE / unreachable schedds."
+                          % meta["unreachable"], "dim")]
         return [paint("No queued (idle) jobs — the queue is clear.", "dim")]
     inner = width - 4
     body = [paint(fit(" %-11s %-10s %-19s %7s  %s" % (
@@ -822,20 +1050,22 @@ def panel_queued(st, user, width):
     for j in idle[:6]:
         body.append(_queued_row(j, user, inner))
     if len(idle) > 6:
-        body.append(paint("  … %d more queued (Enter to see all)" % (len(idle) - 6), "dim"))
+        body.append(paint("  … %d more queued in detail (Enter to see all)"
+                          % (len(idle) - 6), "dim"))
+    body += _queue_overflow_notes(st, itemize=False)
     return body
 
 
 def panel_queued_title(st):
-    idle = st.get("idle") or []
-    if not idle:
+    meta = st.get("idle_meta")
+    if meta is PENDING or not meta:
         return "QUEUED JOBS"
-    waiting = sum(1 for j in idle if j.get("match") and j["match"][0] != "LIKELY")
-    blocked = sum(1 for j in idle if j.get("match") and j["match"][0] == "BLOCKED")
-    extra = "   %d need resources" % waiting if waiting else "   all matchable"
-    if blocked:
-        extra += " · %d blocked" % blocked
-    return "QUEUED JOBS   %d idle%s" % (len(idle), extra)
+    total = meta.get("total", 0)
+    if not total:
+        return "QUEUED JOBS"
+    users = meta.get("users", 0)
+    tail = "  ·  %d user%s waiting" % (users, "" if users == 1 else "s") if users else ""
+    return "QUEUED JOBS   %d idle%s" % (total, tail)
 
 
 # ---------------------------------------------------------------------------
@@ -843,6 +1073,8 @@ def panel_queued_title(st):
 # ---------------------------------------------------------------------------
 
 def detail_jobs(st, user, width):
+    if st["jobs"] is PENDING:
+        return _loading_body()
     if st["jerr"]:
         return [paint("error: " + st["jerr"], "red")]
     jobs = st["jobs"]
@@ -870,6 +1102,8 @@ def detail_jobs(st, user, width):
 
 
 def detail_priority(st, user, width):
+    if st["prows"] is PENDING:
+        return _loading_body()
     if st["perr"]:
         return [paint("error: " + st["perr"], "red")]
     rows = st["prows"]
@@ -896,6 +1130,8 @@ def detail_priority(st, user, width):
 
 def detail_cluster(st, user, width):
     out = []
+    if st["cerr"] is PENDING:
+        return _loading_body()
     if st["cerr"]:
         return [paint("error: " + st["cerr"], "red")]
     cl, q = st["cluster"], st["queue"]
@@ -943,6 +1179,8 @@ def detail_cluster(st, user, width):
 
 
 def detail_freegpu(st, user, width):
+    if st["gpu_nodes"] is PENDING:
+        return _loading_body()
     if st["gerr"]:
         return [paint("error: " + st["gerr"], "red")]
     nodes = st["gpu_nodes"]
@@ -975,52 +1213,65 @@ def detail_freegpu(st, user, width):
 
 
 def detail_users(st, user, width):
+    if st["users"] is PENDING:
+        return _loading_body()
     if st["uerr"]:
         return [paint("error: " + st["uerr"], "red")]
     users = st["users"]
     if not users:
-        return [paint("No jobs in the queue.", "dim")]
+        return [paint("No running jobs.", "dim")]
     ranked = sorted(users.items(), key=lambda kv: (-kv[1]["gpu"], -kv[1]["cpu"],
-                                                    -kv[1]["idle"]))
+                                                    -kv[1]["jobs"]))
     tcpu = sum(v["cpu"] for v in users.values())
     tgpu = sum(v["gpu"] for v in users.values())
     tjob = sum(v["jobs"] for v in users.values())
-    tidle = sum(v["idle"] for v in users.values())
     out = [
-        paint(" %d users in the queue · %d running jobs · %d CPU · %d GPU in use" % (
+        paint(" %d users running · %d running jobs · %d CPU · %d GPU in use" % (
             len(users), tjob, tcpu, tgpu), "bold"),
         "",
-        paint(" %4s  %-16s %8s %8s %6s %8s" % (
-            "#", "USER", "RUN JOBS", "CPU", "GPU", "IDLE"), "bold", "dim"),
+        paint(" %4s  %-18s %10s %8s %6s" % (
+            "#", "USER", "RUN JOBS", "CPU", "GPU"), "bold", "dim"),
     ]
     for i, (owner, u) in enumerate(ranked, 1):
-        txt = " %4d  %-16s %8d %8d %6d %8d" % (
-            i, owner, u["jobs"], u["cpu"], u["gpu"], u["idle"])
+        txt = " %4d  %-18s %10d %8d %6d" % (
+            i, owner, u["jobs"], u["cpu"], u["gpu"])
         if owner == user:
             out.append(paint(fit(txt + "   ◂ you", width), "bold", "bcyan"))
         else:
             out.append(fit(txt, width))
     out.append("")
-    out.append(paint(" %4s  %-16s %8d %8d %6d %8d" % (
-        "", "TOTAL", tjob, tcpu, tgpu, tidle), "bold", "dim"))
+    out.append(paint(" %4s  %-18s %10d %8d %6d" % (
+        "", "TOTAL", tjob, tcpu, tgpu), "bold", "dim"))
     return out
 
 
 def detail_queued(st, user, width):
+    if st["idle"] is PENDING:
+        return _loading_body()
     if st["ierr"]:
         return [paint("error: " + st["ierr"], "red")]
     idle = st["idle"]
+    meta = st.get("idle_meta") or {}
     if not idle:
+        if meta.get("unreachable"):
+            return [paint(" %d idle jobs pool-wide, all on CE / unreachable schedds"
+                          " — no per-job detail available." % meta["unreachable"],
+                          "bold")]
         return [paint("No queued (idle) jobs — the queue is clear.", "dim")]
     likely = sum(1 for j in idle if j.get("match") and j["match"][0] == "LIKELY")
     waiting = sum(1 for j in idle if j.get("match") and j["match"][0] == "WAITING")
     blocked = sum(1 for j in idle if j.get("match") and j["match"][0] == "BLOCKED")
+    total, shown = meta.get("total", len(idle)), meta.get("shown", len(idle))
     out = [
-        paint(" %d queued (idle) jobs:  %s likely · %s waiting · %s blocked" % (
-            len(idle), paint(str(likely), "bgreen"), paint(str(waiting), "byellow"),
-            paint(str(blocked), "bred")), "bold"),
-        paint(" Estimate from current free resources + each job's Requirements"
-              " (CPU/GPU/VRAM/model/host).", "dim"),
+        paint(" %d idle jobs pool-wide across %d schedd users; showing %d"
+              " (≤%d per user)." % (total, meta.get("users", 0), shown,
+                                    PER_USER_CAP), "bold"),
+        paint(" Of those shown:  %s likely · %s waiting · %s blocked"
+              " (top %d analyzed)." % (
+                  paint(str(likely), "bgreen"), paint(str(waiting), "byellow"),
+                  paint(str(blocked), "bred"), ANALYZE_CAP), "dim"),
+        paint(" Match is estimated from current free resources + each job's"
+              " Requirements (CPU/GPU/VRAM/model/host).", "dim"),
         paint(" It ignores user priority, preemption, disk and rank — treat it as a guide.", "dim"),
         paint(" Rows are ordered by owner priority (served-first); your jobs are marked ▸.", "dim"),
         "",
@@ -1045,6 +1296,10 @@ def detail_queued(st, user, width):
             cell = paint(label[:avail], "bold", color)
         row = paint(head, "bold", "bcyan") if mine else head
         out.append(row + cell)
+    notes = _queue_overflow_notes(st, itemize=True)
+    if notes:
+        out.append("")
+        out += notes
     return out
 
 
@@ -1068,11 +1323,12 @@ PANEL_TITLES = {
 # Frame composition
 # ---------------------------------------------------------------------------
 
-def render_overview(st, user, host, width, focus=-1, height=None):
+def render_overview(st, user, host, width, focus=-1, height=None, loading=False):
     width = max(60, min(width, 110))
     now = time.strftime("%Y-%m-%d %H:%M:%S")
     left = paint(" CONDOR DASHBOARD", "bold", "bcyan")
-    right = paint("%s@%s" % (user, host), "bold") + paint("  " + now, "dim")
+    tag = paint(" ⟳", "byellow") if loading else ""
+    right = paint("%s@%s" % (user, host), "bold") + tag + paint("  " + now, "dim")
     header = [left + " " * max(1, width - vis_len(left) - vis_len(right)) + right]
     header.append(paint("  ↑/↓ or 1-6 select · Enter expand · r refresh · q quit", "dim")
                   if focus >= 0 else "")
@@ -1114,7 +1370,7 @@ def render_overview(st, user, host, width, focus=-1, height=None):
     return out
 
 
-def render_detail(st, user, host, width, height, focus, scroll):
+def render_detail(st, user, host, width, height, focus, scroll, loading=False):
     width = max(60, width)
     key, _body, detail_fn, _t = PANELS[focus]
     content = detail_fn(st, user, width)
@@ -1126,9 +1382,11 @@ def render_detail(st, user, host, width, height, focus, scroll):
 
     title = PANEL_TITLES.get(key, key.upper())
     clock = time.strftime("%H:%M:%S")
+    mark = "⟳ " if loading else ""
     crumb = (paint(" %s@%s" % (user, host), "bold", "bcyan") + paint("  ▸  ", "dim")
              + paint(title, "bold", "byellow"))
-    head = crumb + " " * max(1, width - vis_len(crumb) - len(clock) - 1) + paint(clock, "dim")
+    head = (crumb + " " * max(1, width - vis_len(crumb) - len(mark) - len(clock) - 1)
+            + paint(mark, "byellow") + paint(clock, "dim"))
     out = [head, paint("─" * width, "dim")]
     out += window
     # pad so the footer sits near the bottom
@@ -1239,6 +1497,81 @@ def print_once(user, host):
     sys.stdout.flush()
 
 
+class BackgroundGather:
+    """Runs gather() on a worker thread so the UI never blocks on condor.
+
+    The old loop called gather() inline, which shells out to a dozen condor
+    queries and can take 10s+ — the whole TUI froze (no input, no redraw) on
+    every refresh. Here the main loop reads the latest snapshot via latest()
+    and asks for a refresh via request(); collection happens off the UI thread,
+    so keystrokes stay responsive even mid-query. gather() also publishes each
+    collector's result as it lands, so the panels fill in progressively instead
+    of the whole dashboard waiting on the slowest query. The previous snapshot
+    keeps showing while a refresh is in flight."""
+
+    def __init__(self, user):
+        self._user = user
+        self._lock = threading.Lock()
+        self._state = new_state()              # blank skeleton: panels show "loading…"
+        self._loading = True
+        self._req = threading.Event()
+        self._stop = threading.Event()
+        self._req.set()                        # kick off the first snapshot
+        self._thread = threading.Thread(target=self._run, name="gather",
+                                        daemon=True)
+        self._thread.start()
+
+    def _publish(self, snap):
+        # Merge only the collectors that have landed onto the last displayed
+        # state. On a refresh this keeps each panel showing its previous data
+        # until the fresh value arrives, instead of blinking back to "loading".
+        with self._lock:
+            merged = dict(self._state)
+            for k, v in snap.items():
+                if v is not PENDING:
+                    merged[k] = v
+            self._state = merged
+
+    def _run(self):
+        while True:
+            self._req.wait()
+            if self._stop.is_set():
+                return
+            self._req.clear()                  # coalesce requests queued while busy
+            with self._lock:
+                self._loading = True
+            try:
+                gather(self._user, publish=self._publish)
+            except Exception:                  # keep the last snapshot on error
+                pass
+            with self._lock:
+                self._loading = False
+
+    def request(self):
+        self._req.set()
+
+    def latest(self):
+        with self._lock:
+            return self._state, self._loading
+
+    def stop(self):
+        self._stop.set()
+        self._req.set()
+
+
+def loading_frame(user, host, width):
+    """First-snapshot screen shown while the initial gather runs in the background."""
+    width = max(60, min(width, 110))
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    left = paint(" CONDOR DASHBOARD", "bold", "bcyan")
+    right = paint("%s@%s" % (user, host), "bold") + paint("  " + now, "dim")
+    header = left + " " * max(1, width - vis_len(left) - vis_len(right)) + right
+    return [header, "",
+            paint("  ⟳ Collecting data from the pool… (this can take a few seconds)",
+                  "byellow"),
+            "", paint("  q quit", "dim")]
+
+
 def interactive_loop(user, host, interval):
     import termios
     import tty
@@ -1249,18 +1582,27 @@ def interactive_loop(user, host, interval):
     mode = "overview"      # or "detail"
     focus = 0
     scroll = 0
-    st = gather(user)
+    fetcher = BackgroundGather(user)   # gathers off-thread; the UI never blocks on it
+    st = None
     last = time.time()
+    prev_frame = None
     try:
         while True:
             size = shutil.get_terminal_size((100, 40))
-            if mode == "overview":
+            new_st, loading = fetcher.latest()
+            if new_st is not None:
+                st = new_st
+            if st is None:
+                frame = loading_frame(user, host, size.columns)
+            elif mode == "overview":
                 frame = render_overview(st, user, host, size.columns, focus=focus,
-                                        height=size.lines)
+                                        height=size.lines, loading=loading)
             else:
                 frame, scroll = render_detail(st, user, host, size.columns,
-                                              size.lines, focus, scroll)
-            draw(frame)
+                                              size.lines, focus, scroll, loading=loading)
+            if frame != prev_frame:            # only touch the terminal when it changed
+                draw(frame)
+                prev_frame = frame
 
             timeout = max(0.0, interval - (time.time() - last))
             page = max(1, size.lines - 5)
@@ -1268,7 +1610,7 @@ def interactive_loop(user, host, interval):
                 if key in ("q", "Q"):
                     return
                 if key in ("r", "R"):
-                    st = gather(user)
+                    fetcher.request()
                     last = time.time()
                 elif mode == "overview":
                     if key in ("DOWN", "j", "TAB"):
@@ -1298,11 +1640,12 @@ def interactive_loop(user, host, interval):
                         focus, scroll = (focus + 1) % len(PANELS), 0
 
             if time.time() - last >= interval:
-                st = gather(user)
+                fetcher.request()          # ask the worker for a fresh snapshot
                 last = time.time()
     except KeyboardInterrupt:
         pass
     finally:
+        fetcher.stop()
         sys.stdout.write("\033[?25h\033[?1049l")
         sys.stdout.flush()
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
